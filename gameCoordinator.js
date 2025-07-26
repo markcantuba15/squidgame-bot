@@ -96,7 +96,7 @@ function resetGameInternal() {
     currentRegisteredPlayers = [];
     currentAdminId = null;
     currentPlayerDataFile = null;
-    currentRound = 0;
+    currentRound = 1;
     currentEliminatedPlayerSpamMap = null;
     currentSpamThreshold = null;
     currentSpamIntervalMs = null;
