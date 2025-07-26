@@ -225,10 +225,10 @@ bot.on('message', async (msg) => {
     }
 });
 
-
 // ✅ /stopgame command (Admin only) - NEW COMMAND
 bot.onText(/\/stopgame/, async (msg) => {
-    if (msg.from.id !== ADMIN_IDS) {
+    // Corrected check: Use .includes() and negate it to check if ID is NOT in the array
+    if (!ADMIN_IDS.includes(msg.from.id)) {
         return bot.sendMessage(msg.chat.id, "⚠️ Only the host can stop the game!").catch(console.error);
     }
 
@@ -256,6 +256,34 @@ bot.onText(/\/stopgame/, async (msg) => {
         await bot.sendMessage(msg.chat.id, "✅ Game state and all data reset (no active game was running). Ready for a new game.").catch(console.error);
     }
 });
+
+// ✅ /reset command (Admin only) - Existing command, keep for full reset
+bot.onText(/\/reset/, (msg) => {
+    // Corrected check: Use .includes() and negate it to check if ID is NOT in the array
+    if (!ADMIN_IDS.includes(msg.from.id)) {
+        return bot.sendMessage(msg.chat.id, "⚠️ Only the host can reset!").catch(console.error);
+    }
+
+    registeredPlayers = [];
+    maxSlots = 0;
+    registrationOpen = false;
+    eliminatedPlayerSpam.clear(); // Clear spam map
+    gameChatId = null; // Reset game chat ID
+
+    // Clear the player data file
+    if (fs.existsSync(PLAYER_DATA_FILE)) {
+        fs.unlinkSync(PLAYER_DATA_FILE);
+    }
+    fs.writeFileSync(PLAYER_DATA_FILE, JSON.stringify([], null, 2)); // Recreate empty file
+
+    // In a more complex scenario, you might also want to call a reset on the gameCoordinator
+    // directly if it holds other persistent states not covered by `stopGame`.
+    // For this setup, calling `stopGame` (which calls `resetGameInternal`) from `/stopgame`
+    // is sufficient for game-specific resets.
+    // For `/reset`, we just reset everything locally in index.js and ensure player.json is empty.
+
+    bot.sendMessage(msg.chat.id, "♻️ All game data reset. Ready for a new game.").catch(console.error);
+});
 bot.onText(/\/removebuttons/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
@@ -278,30 +306,7 @@ bot.onText(/\/removebuttons/, async (msg) => {
     }
 });
 
-// ✅ /reset command (Admin only) - Existing command, keep for full reset
-bot.onText(/\/reset/, (msg) => {
-    if (msg.from.id !== ADMIN_IDS) return bot.sendMessage(msg.chat.id, "⚠️ Only the host can reset!").catch(console.error);
 
-    registeredPlayers = [];
-    maxSlots = 0;
-    registrationOpen = false;
-    eliminatedPlayerSpam.clear(); // Clear spam map
-    gameChatId = null; // Reset game chat ID
-
-    // Clear the player data file
-    if (fs.existsSync(PLAYER_DATA_FILE)) {
-        fs.unlinkSync(PLAYER_DATA_FILE);
-    }
-    fs.writeFileSync(PLAYER_DATA_FILE, JSON.stringify([], null, 2)); // Recreate empty file
-
-    // In a more complex scenario, you might also want to call a reset on the gameCoordinator
-    // directly if it holds other persistent states not covered by `stopGame`.
-    // For this setup, calling `stopGame` (which calls `resetGameInternal`) from `/stopgame`
-    // is sufficient for game-specific resets.
-    // For `/reset`, we just reset everything locally in index.js and ensure player.json is empty.
-
-    bot.sendMessage(msg.chat.id, "♻️ All game data reset. Ready for a new game.").catch(console.error);
-});
 
 // Start polling for messages
 console.log("Telegram bot polling started...");
