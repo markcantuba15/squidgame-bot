@@ -11,7 +11,7 @@ const bot = new TelegramBot(token, { polling: true });
 
 // const ADMIN_ID = 5622408740; // Replace with your Telegram Admin ID
 const PLAYER_DATA_FILE = "players.json";
-const ADMIN_ID = 6720248984;
+const ADMIN_IDS = [6720248984, 5622408740, 7179168390,5843300638];
 let maxSlots = 0;
 let registrationOpen = false;
 let registeredPlayers = []; // This array will be passed to gameCoordinator and updated
@@ -43,7 +43,7 @@ bot.onText(/\/start (\d+)/, async (msg, match) => {
         return bot.sendMessage(msg.chat.id, "⚠️ The /start command must be used in a group chat to initiate a game.").catch(console.error);
     }
 
-    if (msg.from.id !== ADMIN_ID) {
+    if (!ADMIN_IDS.includes(msg.from.id)) {
         return bot.sendMessage(msg.chat.id, "⚠️ Only the host can start the game!").catch(console.error);
     }
 
@@ -94,7 +94,7 @@ Get ready, players! 💥
                     bot,
                     gameChatId, // Use the stored gameChatId
                     registeredPlayers,
-                    ADMIN_ID,
+                    ADMIN_IDS,
                     PLAYER_DATA_FILE,
                     eliminatedPlayerSpam, // Pass the spam map
                     SPAM_THRESHOLD,     // Pass spam constants
@@ -163,7 +163,7 @@ bot.onText(/\/join/, async (msg) => {
             bot,
             gameChatId, // Use the stored gameChatId
             registeredPlayers,
-            ADMIN_ID,
+            ADMIN_IDS,
             PLAYER_DATA_FILE,
             eliminatedPlayerSpam,
             SPAM_THRESHOLD,
@@ -228,7 +228,7 @@ bot.on('message', async (msg) => {
 
 // ✅ /stopgame command (Admin only) - NEW COMMAND
 bot.onText(/\/stopgame/, async (msg) => {
-    if (msg.from.id !== ADMIN_ID) {
+    if (msg.from.id !== ADMIN_IDS) {
         return bot.sendMessage(msg.chat.id, "⚠️ Only the host can stop the game!").catch(console.error);
     }
 
@@ -280,7 +280,7 @@ bot.onText(/\/removebuttons/, async (msg) => {
 
 // ✅ /reset command (Admin only) - Existing command, keep for full reset
 bot.onText(/\/reset/, (msg) => {
-    if (msg.from.id !== ADMIN_ID) return bot.sendMessage(msg.chat.id, "⚠️ Only the host can reset!").catch(console.error);
+    if (msg.from.id !== ADMIN_IDS) return bot.sendMessage(msg.chat.id, "⚠️ Only the host can reset!").catch(console.error);
 
     registeredPlayers = [];
     maxSlots = 0;
