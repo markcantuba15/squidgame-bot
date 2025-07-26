@@ -1,0 +1,665 @@
+yers();
+
+// --- Game 3 State Variables (no changes here) ---
+let game3Started = false;
+let pairs = [];
+let sacrificePhaseStarted = false; // Indicates start of rolling phase
+let allowPickingPartner = false;
+let currentRollPhase = "first"; // Tracks if it's the first or second roll
+
+// Stores userId -> timestamp of last roll attempt for debouncing
+let playerRollCooldowns = new Map();
+const COOLDOWN_MS = 2000; // 2 seconds cooldown for rapid clicks
+
+// To keep track of the partner phase timeout, so we can clear it if needed
+let partnerPhaseTimeout;
+let firstRollPhaseTimeout;
+let secondRollPhaseTimeout;
+let partnerPhaseInterval;
+
+
+// --- Functions for Roll Reply Keyboard (no changes here) ---
+async function sendRollButtons(chatId) {
+  try {
+    await bot.sendMessage(chatId, "Ready to roll?", {
+      reply_markup: {
+        keyboard: [
+          [{ text: "🎲 Roll" }] // Single button for rolling
+        ],
+        resize_keyboard: true,
+        one_time_keyboard: false // Keep it visible
+      }
+    });
+    console.log("Roll reply keyboard sent successfully.");
+  } catch (err) {
+    console.error(`❌ Failed to send roll buttons to chat ${chatId}:`, err.message);
+    bot.sendMessage(chatId, `⚠️ Error sending roll buttons: ${err.message}`).catch(console.error);
+  }
+}
+
+async function removeRollButtons(chatId) {
+  try {
+    await bot.sendMessage(chatId, "Removing roll buttons...", {
+      reply_markup: {
+        remove_keyboard: true
+      }
+    });
+    console.log("Roll reply keyboard removed successfully.");
+  } catch (e) {
+    console.warn(`⚠️ Failed to remove roll reply keyboard:`, e);
+  }
+}
+// --- End New Functions ---
+
+bot.onText(/\/startgame3/, async (msg) => {
+  if (msg.from.id !== ADMIN_ID) return bot.sendMessage(msg.chat.id, "⚠️ Only the host can start Game 3!");
+  if (game3Started) return bot.sendMessage(msg.chat.id, "⚠️ Game 3 already started!");
+
+  // ✅ Check if there are alive players
+  const alivePlayers = registeredPlayers.filter(p => p.status === "alive" || p.status === "safe");
+  if (alivePlayers.length < 2) { // Need at least 2 for pairs
+    return bot.sendMessage(msg.chat.id, "❌ Cannot start Game 3! Need at least 2 alive players to form pairs.");
+  }
+
+  // Reset game state
+  game3Started = true;
+  pairs = []; // Reset pairs at the very start of the game
+  sacrificePhaseStarted = false;
+  allowPickingPartner = false;
+  currentRollPhase = "first";
+  playerRollCooldowns.clear(); // Clear cooldowns for a fresh game
+
+  // Reset players for Game 3
+  registeredPlayers.forEach(p => {
+    if (p.status === "alive" || p.status === "safe") {
+      p.pickedPartner = null;
+      p.partnerConfirmed = false;
+      p.firstRoll = null;
+      p.secondRoll = null;
+    }
+  });
+  fs.writeFileSync('players.json', JSON.stringify(registeredPlayers, null, 2));
+
+  // Image path
+  const trustImgPath = path.resolve(__dirname, "images", "shake1.jpg");
+
+  await bot.sendPhoto(msg.chat.id, fs.createReadStream(trustImgPath), {
+    caption:
+      "🤝 <b>Game 3: TRUST GAME!</b>\n\n" +
+      "This round is a <b>partner-based</b> game. You must find a partner you trust — or face elimination.\n\n" +
+      "⏰ You have <b>2 minutes</b> to look for and choose your partner. After this phase ends, the Front Man will announce how to <b>lock in</b> your chosen partner.\n\n" +
+      "⚠️ <b>Important:</b> Players without partners after this phase will be <b>eliminated without mercy</b>.\n\n" +
+      "Good luck... choose wisely! 🔥",
+    parse_mode: "HTML"
+  })
+    .catch((err) => {
+      console.error("❌ Failed to send trust game image:", err);
+      bot.sendMessage(msg.chat.id, "🤝 Game 3: TRUST GAME!\n\nPick your most trusted friend as your partner. You have 2 minutes to decide...");
+    });
+
+  // Phase 1: Announce and wait for initial 1 minute (for players to discuss)
+  setTimeout(async () => {
+    allowPickingPartner = true; // Now players can start using /pick
+    await bot.sendMessage(msg.chat.id,
+      "🤝 <b>Lock your choice!</b>\n\n" +
+      "🕰️ Now is the time to officially pick your partner.\n" +
+      "Use the command: <b>/pick @username</b> to lock in your partner.\n\n" +
+      "⏰ You have <b>1 minute</b> to decide. After this, there is no turning back.\n\n" +
+      "⚠️ <b>Remember:</b> If you fail to pick a partner in time, you will be <b>eliminated</b>."
+      , { parse_mode: "HTML" });
+
+    // Start Partner Phase countdown for picking
+    startPartnerPhase(msg.chat.id);
+  }, 1 * 60 * 1000); // Wait 1 minute before allowing /pick
+});
+
+
+function startPartnerPhase(chatId) {
+  let minutesLeft = 1;
+
+  partnerPhaseInterval = setInterval(() => {
+    minutesLeft--;
+    if (minutesLeft > 0) {
+      const noPartners = registeredPlayers.filter(p => (p.status === "alive" || p.status === "safe") && !p.partnerConfirmed);
+
+      const message = `⏰ *${minutesLeft} minute(s) remaining to choose your partner!*\n\n` +
+        `💀 *WARNING: Players without partners when the time is up will be eliminated without mercy!*\n\n` +
+        `🚨 *Current players without partners:* \n${noPartners.map(p => `• ${p.username}`).join('\n') || "✅ Everyone has a partner! Keep it up!"}`;
+
+      bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
+    }
+  }, 60 * 1000); // Update every minute
+
+  partnerPhaseTimeout = setTimeout(() => {
+    clearInterval(partnerPhaseInterval);
+    allowPickingPartner = false; // Stop allowing /pick commands
+
+    // Eliminate players without partners
+    registeredPlayers.forEach(p => {
+      if ((p.status === "alive" || p.status === "safe") && !p.partnerConfirmed) {
+        p.status = "eliminated";
+      }
+    });
+    fs.writeFileSync('players.json', JSON.stringify(registeredPlayers, null, 2)); // Save state after eliminations
+
+    // Filter the 'pairs' array to only include those where both members are still alive/safe
+    // This is the crucial part that replaces the problematic re-formation loop.
+    const validPairsForFight = pairs.filter(pair =>
+      (pair[0].status === "alive" || pair[0].status === "safe") &&
+      (pair[1].status === "alive" || pair[1].status === "safe")
+    );
+    pairs = validPairsForFight; // Update the global pairs array
+
+    const survivors = registeredPlayers.filter(p => p.partnerConfirmed && (p.status === "alive" || p.status === "safe")).map(p => p.username);
+    const eliminatedPlayers = registeredPlayers.filter(p => p.status === "eliminated");
+    const eliminatedNames = eliminatedPlayers.map(p => p.username);
+
+    let summary = `🏁✨ <b>Partner phase has ended!</b> ✨🏁\n\n`;
+    summary += `✅ Found partners:\n${survivors.map(u => `• ${u}`).join('\n') || "None"}\n\n`;
+    summary += `💀 No partners (Eliminated):\n${eliminatedNames.map(u => `• ${u}`).join('\n') || "None"}`;
+
+    bot.sendMessage(chatId, summary, { parse_mode: "HTML" })
+      .then(() => {
+        if (eliminatedPlayers.length === 0) {
+          bot.sendMessage(chatId, "🎉 Amazing! Everyone found a partner and survived! 💪")
+            .then(() => {
+              const goodworkGifPath = path.resolve(__dirname, "gifs", "goodwork.gif");
+              return bot.sendAnimation(chatId, fs.createReadStream(goodworkGifPath));
+            })
+            .then(() => {
+              setTimeout(() => {
+                // Now, this check uses the correctly filtered `pairs` array
+                if (pairs.length === 0) { // If no pairs left after filtering eliminations
+                  bot.sendMessage(chatId, "All players survived the partner phase, but no valid pairs were formed for the fight phase. Game 3 ends here.", { parse_mode: "HTML" });
+                  endGame3Cleanly(chatId);
+                } else {
+                  startFightPhase(chatId);
+                }
+              }, 5000);
+            })
+            .catch(err => {
+              console.error("❌ Error in sending congratulations flow:", err);
+            });
+        } else {
+          const eliminationGifPath = path.resolve(__dirname, "gifs", "bye.gif");
+          bot.sendAnimation(chatId, fs.createReadStream(eliminationGifPath))
+            .then(() => {
+              return bot.sendMessage(chatId, "⚠️ 💀 Players without partners will be kicked in 10 seconds!");
+            })
+            .then(() => {
+              return new Promise(resolve => setTimeout(resolve, 10 * 1000));
+            })
+            .then(async () => {
+              for (const p of eliminatedPlayers) {
+                try {
+                  await bot.banChatMember(chatId, p.id);
+                  console.log(`✅ Kicked (banned) ${p.username}`);
+                } catch (err) {
+                  console.error(`❌ Failed to kick ${p.username}:`, err);
+                }
+              }
+
+              let afterKickMsg = `🏁✅ <b>Partner phase eliminations completed!</b>\n\n`;
+              afterKickMsg += `👥 Remaining Survivors: <b>${survivors.length}</b>\n`;
+              afterKickMsg += `💀 Total Eliminated: <b>${eliminatedNames.length}</b>`;
+
+              await bot.sendMessage(chatId, afterKickMsg, { parse_mode: "HTML" });
+              const moneyGifPath = path.resolve(__dirname, "gifs", "falling-money-squid-game.gif");
+              await bot.sendAnimation(chatId, fs.createReadStream(moneyGifPath));
+              console.log("✅ Celebration GIF sent!");
+            })
+            .then(() => {
+              setTimeout(() => {
+                // Now, this check uses the correctly filtered `pairs` array
+                if (pairs.length === 0) { // If no pairs left after filtering eliminations
+                  bot.sendMessage(chatId, "All surviving players formed pairs, but no pairs were valid for the fight phase. Game 3 ends here.", { parse_mode: "HTML" });
+                  endGame3Cleanly(chatId);
+                } else {
+                  startFightPhase(chatId);
+                }
+              }, 5000);
+            })
+            .catch(err => {
+              console.error("❌ Error in elimination flow:", err);
+            });
+        }
+      })
+      .catch(err => {
+        console.error("❌ Error in partner phase summary:", err);
+      });
+  }, 1 * 60 * 1000);
+}
+
+// Helper to check if a pair already exists (This function is now redundant and can be removed)
+// function partnersExistInPreviousPairs(username1, username2, currentPairs) {
+//     return currentPairs.some(pair =>
+//         (pair[0].username === username1 && pair[1].username === username2) ||
+//         (pair[0].username === username2 && pair[1].username === username1)
+//     );
+// }
+
+bot.onText(/\/pick (.+)/, (msg, match) => {
+  if (!game3Started) return bot.sendMessage(msg.chat.id, "❌ Game 3 is not running!");
+
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
+  const targetUsername = match[1].trim();
+
+  if (!allowPickingPartner) {
+    return bot.sendMessage(chatId, "⚠️ You cannot pick a partner yet! Wait for the Front Man's instruction to lock in your partner.");
+  }
+
+  if (targetUsername === username) {
+    return bot.sendMessage(chatId, "⚠️ You cannot pick yourself as your partner! Please choose someone else.");
+  }
+
+  const player = registeredPlayers.find(p => p.id === userId && (p.status === "alive" || p.status === "safe"));
+  if (!player) return bot.sendMessage(chatId, "❌ You are not in the game or already eliminated!");
+  if (player.partnerConfirmed) return bot.sendMessage(chatId, "⚠️ You have already locked in a partner!");
+
+  const targetPlayer = registeredPlayers.find(p => p.username === targetUsername && (p.status === "alive" || p.status === "safe"));
+  if (!targetPlayer) return bot.sendMessage(chatId, `❌ ${targetUsername} is not available or already eliminated!`);
+  if (targetPlayer.partnerConfirmed) return bot.sendMessage(chatId, `⚠️ ${targetUsername} has already locked in a partner!`);
+
+  // If the target already picked the current player => auto lock both
+  if (targetPlayer.pickedPartner === username) {
+    player.partnerConfirmed = true;
+    targetPlayer.partnerConfirmed = true;
+    player.pickedPartner = null; // Clear pickedPartner after confirmation
+    targetPlayer.pickedPartner = null; // Clear pickedPartner after confirmation
+
+    // Add to pairs array ONLY when mutually confirmed
+    // Ensure this pair doesn't already exist to prevent duplicates if /pick is spammed
+    const isPairAlreadyAdded = pairs.some(p =>
+      (p[0].id === player.id && p[1].id === targetPlayer.id) ||
+      (p[0].id === targetPlayer.id && p[1].id === player.id)
+    );
+
+    if (!isPairAlreadyAdded) {
+      pairs.push([player, targetPlayer]);
+    } else {
+      console.log(`Attempted to add existing pair ${player.username}-${targetPlayer.username}. Skipping.`);
+    }
+
+    bot.sendMessage(chatId, `🤝 ${username} and ${targetUsername} are now officially partners! 🫱🏼‍🫲🏼`);
+  } else {
+    player.pickedPartner = targetUsername;
+    bot.sendMessage(chatId, `✅ You picked ${targetUsername}. Waiting for them to pick you back to lock in!`);
+  }
+
+  fs.writeFileSync('players.json', JSON.stringify(registeredPlayers, null, 2));
+});
+
+
+// --- Modified startFightPhase (no changes here from last version) ---
+async function startFightPhase(chatId) {
+  // Before starting, check if there are any valid pairs formed.
+  if (pairs.length === 0) {
+    bot.sendMessage(chatId, "⚠️ No valid pairs were formed! Game 3 cannot continue the fight phase.", { parse_mode: "HTML" });
+    return endGame3Cleanly(chatId);
+  }
+
+  sacrificePhaseStarted = true;
+  currentRollPhase = "first"; // Reset for each fight phase
+  playerRollCooldowns.clear(); // Clear cooldowns for new phase
+
+  const diceImgPath = path.resolve(__dirname, "images", "dice.png");
+
+  await bot.sendPhoto(chatId, fs.createReadStream(diceImgPath), {
+    caption:
+      "⚔️ <b>FIGHT PHASE!</b>\n\n" +
+      "You are now face-to-face with your partner. This time, you must <b>fight to eliminate each other</b>.\n\n" +
+      "💥 You can choose to roll two dice — your combined points decide who survives.\n" +
+      "😈 Remember: if you roll, you choose your life over your partner's. You show you are willing to sacrifice them to save yourself.\n\n" +
+      "💣 <b>Once you roll, there's no turning back.</b>\n\n" +
+      "👉 Use the <b>🎲 Roll</b> button below to make your first roll.\n" + // Updated instruction
+      "⏰ You have <b>1 minute</b> to decide.",
+    parse_mode: "HTML"
+  })
+    .catch((err) => {
+      console.error("❌ Failed to send dice image:", err);
+    });
+
+  // Send the "Roll" button Reply Keyboard for the first roll
+  await sendRollButtons(chatId);
+
+  // Timeout for first roll phase
+  firstRollPhaseTimeout = setTimeout(async () => {
+    // Show first roll summary
+    const firstRollSummary = [];
+    pairs.forEach(pair => {
+      const [p1, p2] = pair;
+      // Only include players that are still alive/safe from potential earlier eliminations
+      if (p1.status !== "eliminated") firstRollSummary.push(`• ${p1.username}: ${p1.firstRoll !== null ? p1.firstRoll : "Did Not Roll"}`);
+      if (p2.status !== "eliminated") firstRollSummary.push(`• ${p2.username}: ${p2.firstRoll !== null ? p2.firstRoll : "Did Not Roll"}`);
+    });
+
+    await bot.sendMessage(chatId,
+      "🎲 <b>First Roll Results Are In!</b>\n\n" +
+      "Here’s what each player scored in their <b>first roll</b>:\n\n" +
+      `${firstRollSummary.join('\n')}\n\n` +
+      "⚔️ Prepare yourself for the final roll…",
+      { parse_mode: "HTML" }
+    );
+
+    // Switch to second roll phase
+    currentRollPhase = "second";
+    playerRollCooldowns.clear(); // Clear cooldowns for the new phase
+    await bot.sendMessage(chatId,
+      "⏰ <b>First Roll Phase Has Ended!</b>\n\n" +
+      "🎲 Now, it’s time for your <b>second roll</b>.\n\n" +
+      "👉 <b>Press the 🎲 Roll button again</b> to roll your second dice.\n" + // Updated instruction
+      "⏰ You have <b>1 minute</b> to do it. Make it count!",
+      { parse_mode: "HTML" }
+    );
+
+    // No need to re-send roll buttons here if they were never removed.
+    // If 'sendRollButtons' was configured to always remove previous ones,
+    // then you'd call it here. For simplicity and keeping it visible,
+    // we assume it remains.
+
+    // Timeout for second roll phase
+    secondRollPhaseTimeout = setTimeout(() => {
+      resolveFightPhase(chatId);
+    }, 60 * 1000);
+
+  }, 60 * 1000);
+}
+
+
+// --- Modified bot.onText for the "🎲 Roll" button (no changes here from last version) ---
+bot.onText(/🎲 Roll/, async (msg) => {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+  const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
+
+  // Helper function to delete both the user's message and send a temporary bot message
+  const handleSpamRoll = async (chatId, userMsgId, botMessageText) => {
+    // Attempt to delete the user's message
+    try {
+      await bot.deleteMessage(chatId, userMsgId);
+      console.log(`✅ Deleted user's spam message (ID: ${userMsgId}) from ${username}.`);
+    } catch (err) {
+      console.error(`❌ Error deleting user's spam message (ID: ${userMsgId}) from ${username}:`, err.message);
+      // This error often means the bot doesn't have admin permissions to delete user messages.
+      // Or the message is too old (over 48 hours, though unlikely for spam rolls).
+    }
+
+    // Send and then delete the bot's temporary warning message
+    const sentMsg = await bot.sendMessage(chatId, botMessageText, { reply_to_message_id: userMsgId });
+    setTimeout(() => {
+      bot.deleteMessage(chatId, sentMsg.message_id).catch(err => console.error("Error deleting bot's temporary message:", err));
+    }, 3000); // Delete after 3 seconds
+  };
+
+  // --- Debounce Check ---
+  if (playerRollCooldowns.has(userId)) {
+    const lastRollTime = playerRollCooldowns.get(userId);
+    if (Date.now() - lastRollTime < COOLDOWN_MS) {
+      console.log(`User ${userId} attempted to double-roll within cooldown. Handling as spam.`);
+      await handleSpamRoll(chatId, msg.message_id, "⏱️ Please wait a moment before rolling again!");
+      return; // Exit, as it's a spam roll
+    }
+  }
+  playerRollCooldowns.set(userId, Date.now()); // Set cooldown for this attempt
+
+  if (!sacrificePhaseStarted) {
+    playerRollCooldowns.delete(userId); // Clear cooldown if game phase isn't active
+    console.log(`${username} tried to roll outside sacrifice phase. Handling as spam.`);
+    await handleSpamRoll(chatId, msg.message_id, "❌ You can't roll now! The game is not in a rolling phase.");
+    return;
+  }
+
+  const player = registeredPlayers.find(p => p.id === userId && p.partnerConfirmed && p.status !== "eliminated");
+
+  if (!player) {
+    playerRollCooldowns.delete(userId); // Clear cooldown if player isn't eligible
+    console.log(`${username} tried to roll but is not eligible. Handling as spam.`);
+    await handleSpamRoll(chatId, msg.message_id, "❌ You are not in the game or eligible to roll!");
+    return;
+  }
+
+  const playerPair = pairs.find(p => p[0].id === userId || p[1].id === userId);
+  if (!playerPair) {
+    playerRollCooldowns.delete(userId);
+    console.log(`${username} tried to roll but has no valid partner. Handling as spam.`);
+    await handleSpamRoll(chatId, msg.message_id, "❌ You don't have a valid partner to roll with!");
+    return;
+  }
+
+  const rollValue = Math.floor(Math.random() * 6) + 1;
+
+  if (currentRollPhase === "first") {
+    if (player.firstRoll !== null) {
+      console.log(`${username} (ID: ${userId}) tried to roll first dice again. Handling as spam.`);
+      playerRollCooldowns.delete(userId); // Clear cooldown as no new roll was made
+      await handleSpamRoll(chatId, msg.message_id, "⚠️ You already rolled your first dice!");
+      return;
+    }
+    player.firstRoll = rollValue;
+    bot.sendMessage(chatId, `🎲 ${username} rolled their first dice! You rolled a ${rollValue}!`, { reply_to_message_id: msg.message_id });
+  } else if (currentRollPhase === "second") {
+    if (player.secondRoll !== null) {
+      console.log(`${username} (ID: ${userId}) tried to roll second dice again. Handling as spam.`);
+      playerRollCooldowns.delete(userId); // Clear cooldown as no new roll was made
+      await handleSpamRoll(chatId, msg.message_id, "⚠️ You already rolled your second dice!");
+      return;
+    }
+    player.secondRoll = rollValue;
+    bot.sendMessage(chatId, `🎲 ${username} rolled their second dice! You rolled a ${rollValue}!`, { reply_to_message_id: msg.message_id });
+  } else {
+    playerRollCooldowns.delete(userId); // Clear cooldown for invalid phase
+    console.log(`${username} tried to roll in an invalid phase. Handling as spam.`);
+    await handleSpamRoll(chatId, msg.message_id, "❌ Invalid roll phase!");
+    return;
+  }
+
+  fs.writeFileSync('players.json', JSON.stringify(registeredPlayers, null, 2));
+});
+// --- Modified resolveFightPhase (no changes here from last version) ---
+async function resolveFightPhase(chatId) {
+  if (!game3Started) return bot.sendMessage(chatId, "❌ Game 3 is not running!");
+
+  // Ensure all timeouts are cleared just in case
+  clearTimeout(firstRollPhaseTimeout);
+  clearTimeout(secondRollPhaseTimeout);
+
+  // Remove the roll buttons immediately when resolving the fight phase
+  await removeRollButtons(chatId);
+  playerRollCooldowns.clear(); // Clear all cooldowns at the end of the phase
+
+  const survivors = [];
+  const eliminated = [];
+  const finalSummary = [];
+  const battleSummary = [];
+
+  // Filter to only include active pairs where both members are still alive/safe
+  const activePairs = pairs.filter(pair =>
+    (pair[0].status === "alive" || pair[0].status === "safe") &&
+    (pair[1].status === "alive" || pair[1].status === "safe")
+  );
+
+  if (activePairs.length === 0) {
+    await bot.sendMessage(chatId, "No active pairs left to resolve in the Fight Phase. Ending Game 3.", { parse_mode: "HTML" });
+    return endGame3Cleanly(chatId);
+  }
+
+  for (const pair of activePairs) {
+    const [p1, p2] = pair;
+
+    // Default missing rolls to 0
+    p1.firstRoll = p1.firstRoll || 0;
+    p1.secondRoll = p1.secondRoll || 0;
+    p2.firstRoll = p2.firstRoll || 0;
+    p2.secondRoll = p2.secondRoll || 0;
+
+    let p1Total = p1.firstRoll + p1.secondRoll;
+    let p2Total = p2.firstRoll + p2.secondRoll;
+
+    // Condition for tie-breaking roll: totals are tied AND at least one player in the pair made *any* roll
+    if (p1Total === p2Total && (p1Total > 0 || (p1.firstRoll > 0 || p1.secondRoll > 0 || p2.firstRoll > 0 || p2.secondRoll > 0))) {
+      // Re-roll ONLY the second dice for tie-breaking
+      let initialP1SecondRoll = p1.secondRoll;
+      let initialP2SecondRoll = p2.secondRoll;
+      do {
+        p1.secondRoll = Math.floor(Math.random() * 6) + 1;
+        p2.secondRoll = Math.floor(Math.random() * 6) + 1;
+        p1Total = p1.firstRoll + p1.secondRoll;
+        p2Total = p2.firstRoll + p2.secondRoll;
+      } while (p1Total === p2Total);
+
+      battleSummary.push(`⚖️ Tie-break roll for ${p1.username} and ${p2.username}:`);
+      battleSummary.push(`  ${p1.username}: Second Roll ${initialP1SecondRoll} -> ${p1.secondRoll}`);
+      battleSummary.push(`  ${p2.username}: Second Roll ${initialP2SecondRoll} -> ${p2.secondRoll}`);
+      battleSummary.push(`  New totals: ${p1.username} (${p1Total}) vs ${p2.username} (${p2Total})`);
+
+    } else if (p1Total === p2Total && p1Total === 0) { // If both didn't roll at all (total 0)
+      // Both didn't roll, both are eliminated.
+      p1.status = "eliminated";
+      p2.status = "eliminated";
+      eliminated.push(p1.username, p2.username);
+      battleSummary.push(`💀 ${p1.username} and ${p2.username} both failed to roll (0 points total) and are eliminated.`);
+      continue; // Move to next pair
+    }
+
+
+    // Add to summaries
+    finalSummary.push(`🎲 ${p1.username}: First Roll: ${p1.firstRoll}, Second Roll: ${p1.secondRoll}, Total: ${p1Total}`);
+    finalSummary.push(`🎲 ${p2.username}: First Roll: ${p2.firstRoll}, Second Roll: ${p2.secondRoll}, Total: ${p2Total}`);
+
+    // Decide winner based on totals
+    if (p1Total > p2Total) {
+      p1.status = "safe";
+      p2.status = "eliminated";
+      survivors.push(p1.username);
+      eliminated.push(p2.username);
+      battleSummary.push(`✅ ${p1.username} wins (${p1Total} pts) and survives!\n💀 ${p2.username} eliminated (${p2Total} pts).`);
+    } else { // p2Total > p1Total (since ties are resolved, or one rolled 0 and other rolled >0)
+      p2.status = "safe";
+      p1.status = "eliminated";
+      survivors.push(p2.username);
+      eliminated.push(p1.username);
+      battleSummary.push(`✅ ${p2.username} wins (${p2Total} pts) and survives!\n💀 ${p1.username} eliminated (${p1Total} pts).`);
+    }
+  }
+
+  // Merge messages
+  let mergedMessage = ``;
+
+  if (finalSummary.length > 0) {
+    mergedMessage += `🏁 <b>Final Total Points (Both Rolls):</b>\n\n`;
+    finalSummary.forEach(line => {
+      const regex = /🎲 (.+?): First Roll: (\d+), Second Roll: (\d+), Total: (\d+)/;
+      const match = line.match(regex);
+      if (match) {
+        const username = match[1];
+        const firstRoll = match[2];
+        const secondRoll = match[3];
+        const total = match[4];
+
+        mergedMessage += `🎲 ${username}\n`;
+        mergedMessage += `First Roll: ${firstRoll} 🎯\n`;
+        mergedMessage += `Second Roll: ${secondRoll} 🎯\n`;
+        mergedMessage += `Total Points: <b>${total}</b>\n\n`;
+      } else {
+        mergedMessage += `${line}\n`; // Fallback for unmatched lines
+      }
+    });
+  }
+
+  if (battleSummary.length > 0) {
+    mergedMessage += `⚔️ <b>1v1 Battle Outcomes:</b>\n\n`;
+    battleSummary.forEach(line => {
+      mergedMessage += `🟢 ${line}\n\n`;
+    });
+  }
+
+  await bot.sendMessage(chatId, mergedMessage, { parse_mode: "HTML" });
+
+  // Save states after all calculations
+  fs.writeFileSync('players.json', JSON.stringify(registeredPlayers, null, 2));
+
+  const actualEliminatedPlayers = registeredPlayers.filter(p => p.status === "eliminated");
+  const actualEliminatedNames = actualEliminatedPlayers.map(p => p.username);
+
+  if (actualEliminatedPlayers.length > 0) {
+    const eliminationMsg = `💀 <b>The following players were eliminated and will be kicked in 10 seconds:</b>\n\n${actualEliminatedNames.map(u => `• ${u}`).join('\n')}`;
+    await bot.sendMessage(chatId, eliminationMsg, { parse_mode: "HTML" });
+    const eliminationGifPath = path.resolve(__dirname, "gifs", "bye.gif");
+    await bot.sendAnimation(chatId, fs.createReadStream(eliminationGifPath));
+    await new Promise(resolve => setTimeout(resolve, 10 * 1000));
+
+    for (const player of actualEliminatedPlayers) {
+      try {
+        await bot.banChatMember(chatId, player.id);
+        console.log(`✅ Successfully kicked ${player.username}`);
+      } catch (err) {
+        console.error(`❌ Failed to kick ${player.username}:`, err);
+      }
+    }
+
+    let afterKickMsg = `🏁✅ <b>Eliminations Completed!</b>\n\n`;
+    afterKickMsg += `👥 <b>Remaining Survivors:</b> ${survivors.length}\n`;
+    afterKickMsg += `💀 <b>Total Eliminated:</b> ${actualEliminatedNames.length}`;
+
+    await bot.sendMessage(chatId, afterKickMsg, { parse_mode: "HTML" });
+    const moneyGifPath = path.resolve(__dirname, "gifs", "falling-money-squid-game.gif");
+    await bot.sendAnimation(chatId, fs.createReadStream(moneyGifPath));
+    console.log("✅ Celebration GIF sent!");
+  } else {
+    await bot.sendMessage(chatId, `✅ <b>Everyone survived! 🎉</b>`, { parse_mode: "HTML" });
+    const moneyGifPath = path.resolve(__dirname, "gifs", "falling-money-squid-game.gif");
+    await bot.sendAnimation(chatId, fs.createReadStream(moneyGifPath));
+    console.log("✅ Celebration GIF sent!");
+  }
+
+  // End Game 3 cleanly
+  endGame3Cleanly(chatId);
+}
+
+// Helper function to clean up game state
+function endGame3Cleanly(chatId) {
+  registeredPlayers.forEach(p => {
+    if (p.status === "safe") p.status = "alive"; // Reset 'safe' players to 'alive' for next game
+    // Also ensure their roll and partner data is clear
+    p.pickedPartner = null;
+    p.partnerConfirmed = false;
+    p.firstRoll = null;
+    p.secondRoll = null;
+  });
+  fs.writeFileSync('players.json', JSON.stringify(registeredPlayers, null, 2));
+
+  bot.sendMessage(chatId, "🎉 <b>Game 3 has ended!</b>\nGet ready for the next game!", { parse_mode: "HTML" });
+
+  // Reset all game state flags
+  game3Started = false;
+  pairs = [];
+  sacrificePhaseStarted = false;
+  allowPickingPartner = false;
+  currentRollPhase = "first";
+  playerRollCooldowns.clear(); // Ensure cleared
+
+  // Clear any lingering timeouts/intervals
+  clearTimeout(partnerPhaseTimeout);
+  clearInterval(partnerPhaseInterval);
+  clearTimeout(firstRollPhaseTimeout);
+  clearTimeout(secondRollPhaseTimeout);
+
+  partnerPhaseTimeout = null;
+  partnerPhaseInterval = null;
+  firstRollPhaseTimeout = null;
+  secondRollPhaseTimeout = null;
+}
+
+
+// Add a /stopgame3 for debugging or emergency stop
+bot.onText(/\/stopgame3/, async (msg) => {
+  if (msg.from.id !== ADMIN_ID) return bot.sendMessage(msg.chat.id, "⚠️ Only the host can stop Game 3!");
+  if (!game3Started) return bot.sendMessage(msg.chat.id, "❌ Game 3 is not running!");
+
+  await bot.sendMessage(msg.chat.id, "🛑 Game 3 has been forcefully stopped and reset!");
+  await removeRollButtons(msg.chat.id); // Remove roll buttons if they are active
+
+  endGame3Cleanly(msg.chat.id); // Use the new cleanup function
+});

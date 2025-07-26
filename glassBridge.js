@@ -1,0 +1,624 @@
+// games/betrayal/glassBridge.js - Betrayal Game: The Glass Bridge
+const fs = require("fs");
+const path = require("path");
+
+// Module-scoped variables to hold the context passed from the game coordinator
+let currentBotInstance = null;
+let currentChatId = null;
+let currentRegisteredPlayers = [];
+let currentAdminId = null;
+let currentPlayerDataFile = null;
+let gameEndCallback = null; // Callback to notify the game coordinator when this game ends
+let eliminatedPlayerSpamMap = null;
+let spamThreshold = null;
+let spamIntervalMs = null;
+
+// Game-specific state variables for Glass Bridge
+const BRIDGE_CHOICE_TIMEOUT = 60 * 1000; // 1 minute for choices
+let game4Started = false;
+let game4JumpNumber = 1;
+const maxJumps = 2; // Number of jumps required to cross the bridge
+let game4Choices = {}; // { userId: "left" or "right" } for the current jump
+let game4Timer = null; // Timer for the current jump's choices
+let game4AlreadyNotified = {}; // { userId: true } - Tracks if a player has been notified they already picked in *this jump*
+let game4NotificationMessageIds = {}; // { userId: message_id } - Stores message IDs of "already picked" notifications for deletion
+let game4MessagesToClean = []; // Array to store IDs of messages sent by the bot that should be cleared
+
+// Telegram listener IDs to manage their lifecycle
+let leftButtonListenerId = null;
+let rightButtonListenerId = null;
+let stopGame4ListenerId = null;
+
+// --- Game Assets Paths (relative to the project root) ---
+const BRIDGE_IMAGE_PATH = path.resolve(__dirname, "..", "..", "images", "bridge-game.jpg");
+const CHOOSE_IMAGE_PATH = path.resolve(__dirname, "..", "..", "images", "choose1.jpg"); // Assuming this is the image for choosing
+const BYE_GIF_PATH = path.resolve(__dirname, "..", "..", "gifs", "bye.gif");
+const FALLING_MONEY_GIF_PATH = path.resolve(__dirname, "..", "..", "gifs", "falling-money-squid-game.gif"); // For game end summary
+
+// --- Utility Functions (encapsulated within this module) ---
+
+/**
+ * Retrieves a player's username from the registeredPlayers array.
+ * @param {number} id - The user ID.
+ * @returns {string} The username or "Unknown Player".
+ */
+function getUsernameById(id) {
+    const player = currentRegisteredPlayers.find(p => p.id === id);
+    if (!player) {
+        return "Unknown Player";
+    }
+    return player.username ? (player.username.startsWith("@") ? player.username : `@${player.username}`) : (player.first_name || "Unknown Player");
+}
+
+/**
+ * Handles spam attempts from eliminated players.
+ * @param {number} userId - The ID of the user.
+ * @param {number} messageId - The ID of the message to potentially delete.
+ * @param {string} username - The username of the player for logging.
+ * @returns {Promise<boolean>} True if the message was deleted due to spam, false otherwise.
+ */
+async function handleEliminatedPlayerSpam(userId, messageId, username) {
+    let spamData = eliminatedPlayerSpamMap.get(userId);
+    const currentTime = Date.now(); // Corrected from Date.Now()
+
+    if (!spamData || (currentTime - spamData.lastMsgTime > spamIntervalMs)) {
+        spamData = { count: 1, lastMsgTime: currentTime };
+    } else {
+        spamData.count++;
+        spamData.lastMsgTime = currentTime;
+    }
+
+    eliminatedPlayerSpamMap.set(userId, spamData);
+
+    if (spamData.count >= spamThreshold) {
+        try {
+            await currentBotInstance.deleteMessage(currentChatId, messageId).catch(console.error);
+            console.log(`Deleted spam message from ${username} (ID: ${userId})`);
+            spamData.count = 0; // Reset count after deleting to prevent continuous deletion
+            eliminatedPlayerSpamMap.set(userId, spamData);
+            return true;
+        } catch (error) {
+            console.error(`Error deleting spam message from ${username} in chat ${currentChatId}:`, error.message);
+            spamData.count = 0;
+            eliminatedPlayerSpamMap.set(userId, spamData);
+            return false;
+        }
+    }
+    return false;
+}
+
+/**
+ * Mutes a player in the chat by restricting their ability to send messages.
+ * @param {number} chatId - The ID of the chat.
+ * @param {number} userId - The ID of the user to mute.
+ * @param {string} username - The username for logging/messages.
+ */
+async function mutePlayer(chatId, userId, username) {
+    try {
+        await currentBotInstance.restrictChatMember(chatId, userId, {
+            can_send_messages: false, can_send_audios: false, can_send_documents: false,
+            can_send_photos: false, can_send_videos: false, can_send_video_notes: false,
+            can_send_polls: false, can_send_other_messages: false,
+            can_add_web_page_previews: false, can_change_info: false, can_invite_users: false,
+            can_pin_messages: false, can_manage_topics: false
+        }).catch(console.error);
+        console.log(`Successfully muted ${username} (ID: ${userId}) in chat ${chatId}`);
+        const muteConfirmMsg = await currentBotInstance.sendMessage(chatId, `🔇 ${username} has been muted due to elimination.`, { disable_notification: true }).catch(console.error);
+        if (muteConfirmMsg) {
+            setTimeout(() => {
+                currentBotInstance.deleteMessage(chatId, muteConfirmMsg.message_id).catch(err => console.error("Error deleting mute confirmation message:", err.message));
+            }, 5000);
+        }
+    } catch (err) {
+        console.error(`❌ Failed to mute ${username} (ID: ${userId}) in chat ${chatId}:`, err.message);
+        if (err.response && err.response.statusCode === 400 && err.response.description.includes("not enough rights")) {
+            await currentBotInstance.sendMessage(chatId, `⚠️ Failed to mute ${username}. Make sure the bot is an admin with 'Restrict members' permission!`).catch(console.error);
+        }
+    }
+}
+
+/**
+ * Sends a message and stores its ID for later cleanup.
+ * @param {number} chatId
+ * @param {string} text
+ * @param {object} [options={}]
+ * @returns {Promise<TelegramBot.Message|null>}
+*/
+async function sendAndStoreMessage(chatId, text, options = {}) {
+    try {
+        const message = await currentBotInstance.sendMessage(chatId, text, options).catch(console.error);
+        if (message) {
+            game4MessagesToClean.push(message.message_id); // Store message ID for later deletion
+        }
+        return message;
+    } catch (err) {
+        console.error(`❌ Error sending message to chat ${chatId}:`, err.message);
+        return null;
+    }
+}
+
+/**
+ * Deletes a specific message from the chat.
+ * Logs only critical errors, suppresses "message to delete not found".
+ * @param {number} chatId
+ * @param {number} messageId
+ */
+async function deleteMessage(chatId, messageId) {
+    if (!messageId) return; // Ensure messageId is valid
+    try {
+        await currentBotInstance.deleteMessage(chatId, messageId).catch(console.error);
+    } catch (err) {
+        if (err.response && err.response.statusCode === 400 && err.response.description && err.response.description.includes("message to delete not found")) {
+            // console.warn(`⚠️ Tried to delete message ${messageId} in chat ${chatId} but it was already gone.`);
+        } else {
+            console.error(`❌ Failed to delete message ${messageId} in chat ${chatId}:`, err.message);
+        }
+    }
+}
+
+/**
+ * Clears all stored bot messages for the current game from the chat.
+ * Includes clearing "already picked" notifications.
+ * @param {number} chatId
+ */
+async function clearGameSpecificMessages(chatId) {
+    // Delete general game messages
+    for (const msgId of game4MessagesToClean) {
+        await deleteMessage(chatId, msgId);
+    }
+    game4MessagesToClean = [];
+
+    // Delete "already picked" notification messages
+    for (const userId in game4NotificationMessageIds) {
+        await deleteMessage(chatId, game4NotificationMessageIds[userId]);
+    }
+    game4NotificationMessageIds = {}; // Reset these IDs for the new round/game
+    game4AlreadyNotified = {}; // Reset notification flags
+}
+
+/**
+ * Resets all game 4 state variables to their initial values.
+ */
+function resetGame4State() {
+    game4Started = false;
+    game4JumpNumber = 1;
+    game4Choices = {};
+    if (game4Timer) clearTimeout(game4Timer);
+    game4Timer = null;
+    game4AlreadyNotified = {};
+    game4NotificationMessageIds = {};
+    game4MessagesToClean = []; // Clear any remaining message IDs to delete
+}
+
+// --- Functions for Jump Reply Keyboard ---
+async function sendJumpChoiceButtons(chatId) {
+    try {
+        const message = await currentBotInstance.sendMessage(chatId, "Choose your path!", {
+            reply_markup: {
+                keyboard: [
+                    [{ text: "👈 Left" }, { text: "👉 Right" }]
+                ],
+                resize_keyboard: true,
+                one_time_keyboard: false
+            }
+        }).catch(console.error);
+        if (message) {
+            // We might want to store this message ID if we want to delete this specific "Choose your path!" message
+            // game4MessagesToClean.push(message.message_id);
+        }
+    } catch (err) {
+        console.error(`❌ Failed to send jump choice buttons to chat ${chatId}:`, err.message);
+        await currentBotInstance.sendMessage(chatId, `⚠️ Error sending jump choice buttons: ${err.message}`).catch(console.error);
+    }
+}
+
+async function removeJumpChoiceButtons(chatId) {
+    try {
+        // Send a temporary message to trigger keyboard removal
+        await currentBotInstance.sendMessage(chatId, "...", {
+            reply_markup: {
+                remove_keyboard: true
+            }
+        }).catch(console.error);
+    } catch (e) {
+        console.warn(`⚠️ Failed to remove jump choice reply keyboard:`, e.message);
+    }
+}
+// --- End Functions ---
+
+/**
+ * Handles a player's shape guess.
+ * @param {Object} msg - The Telegram message object.
+ * @param {string} choice - The choice made ("left" or "right").
+ */
+async function handleJumpChoice(msg, choice) {
+    const userId = msg.from.id;
+    const username = getUsernameById(userId);
+    const chatId = msg.chat.id;
+    const userMessageId = msg.message_id;
+
+    if (chatId !== currentChatId || !game4Started) {
+        await deleteMessage(chatId, userMessageId);
+        return;
+    }
+
+    const player = currentRegisteredPlayers.find(p => p.id === userId && p.status === "alive");
+    if (!player) {
+        await deleteMessage(chatId, userMessageId);
+        // Use spam handler for eliminated players if they try to interact
+        if (currentRegisteredPlayers.find(p => p.id === userId && p.status === "eliminated")) {
+            const isSpam = await handleEliminatedPlayerSpam(userId, userMessageId, username);
+            if (isSpam) return;
+            const botResponse = await currentBotInstance.sendMessage(chatId, `💀 ${username}, you are eliminated and cannot jump.`, { reply_to_message_id: userMessageId }).catch(console.error);
+            if (botResponse) setTimeout(() => deleteMessage(chatId, botResponse.message_id), 7000);
+        }
+        return;
+    }
+
+    if (game4Choices[userId]) {
+        // Player already picked this jump (spam scenario)
+        await deleteMessage(chatId, userMessageId);
+
+        if (!game4AlreadyNotified[userId]) {
+            try {
+                const notificationMsg = await currentBotInstance.sendMessage(chatId, "⚠️ You already picked this jump!", { reply_to_message_id: userMessageId }).catch(console.error);
+                if (notificationMsg) {
+                    game4NotificationMessageIds[userId] = notificationMsg.message_id;
+                    game4AlreadyNotified[userId] = true;
+                }
+            } catch (err) {
+                console.error(`❌ Error sending "already picked" notification to ${username}:`, err.message);
+            }
+        } else if (game4NotificationMessageIds[userId]) {
+            await deleteMessage(chatId, game4NotificationMessageIds[userId]);
+            try {
+                const notificationMsg = await currentBotInstance.sendMessage(chatId, "⚠️ You already picked this jump!", { reply_to_message_id: userMessageId }).catch(console.error);
+                if (notificationMsg) game4NotificationMessageIds[userId] = notificationMsg.message_id;
+            } catch (err) {
+                console.error(`❌ Error resending "already picked" notification to ${username}:`, err.message);
+            }
+        }
+        return;
+    }
+
+    // Valid, first-time choice for this jump
+    game4Choices[userId] = choice;
+    await sendAndStoreMessage(chatId, `✅ ${username} chose ${choice}!`, { reply_to_message_id: userMessageId });
+
+    // Check if all alive players have made a choice
+    const aliveCount = currentRegisteredPlayers.filter(p => p.status === "alive").length;
+    if (Object.keys(game4Choices).length === aliveCount) {
+        clearTimeout(game4Timer); // All choices in, resolve immediately
+        resolveBridgeRound(chatId);
+    }
+}
+
+
+async function announceJump(chatId) {
+    // Reset notification trackers for the new jump
+    game4AlreadyNotified = {};
+    game4NotificationMessageIds = {};
+
+    if (game4Timer) clearTimeout(game4Timer); // Clear any previous timer
+    game4Timer = setTimeout(() => {
+        resolveBridgeRound(chatId);
+    }, BRIDGE_CHOICE_TIMEOUT); // Use the defined timeout constant
+}
+
+async function resolveBridgeRound(chatId) {
+    if (game4Timer) clearTimeout(game4Timer); // Ensure no lingering timer
+
+    await removeJumpChoiceButtons(chatId); // Remove the reply keyboard
+    await clearGameSpecificMessages(chatId); // Clean up all bot messages from the round
+
+    const alivePlayers = currentRegisteredPlayers.filter(p => p.status === "alive");
+
+    // If no players left, end the game immediately
+    if (alivePlayers.length === 0) {
+        summarizeGame4(chatId);
+        return;
+    }
+
+    const safeSide = Math.random() < 0.5 ? "left" : "right";
+    const survivorsThisJump = [];
+    const eliminatedThisJump = [];
+
+    for (const p of alivePlayers) {
+        if (!game4Choices[p.id]) {
+            // Player did not choose or timed out
+            p.status = "eliminated";
+            eliminatedThisJump.push(p);
+            await mutePlayer(chatId, p.id, getUsernameById(p.id));
+        } else if (game4Choices[p.id] !== safeSide) {
+            // Player chose the wrong side
+            p.status = "eliminated";
+            eliminatedThisJump.push(p);
+            await mutePlayer(chatId, p.id, getUsernameById(p.id));
+        } else {
+            // Player chose the safe side
+            survivorsThisJump.push(getUsernameById(p.id));
+            p.bridgeJump = (p.bridgeJump || 0) + 1; // Increment jump count for survivors
+        }
+    }
+
+    // Update players.json with new statuses and jump counts
+    fs.writeFileSync(currentPlayerDataFile, JSON.stringify(currentRegisteredPlayers, null, 2));
+
+    let msg = `💥 <b>SAFE SIDE:</b> ${safeSide.toUpperCase()}!\n\n`;
+    msg += `✅ <b>SURVIVORS THIS JUMP:</b>\n`;
+    msg += survivorsThisJump.length > 0 ? survivorsThisJump.map(u => `• ${u}`).join('\n') : "None";
+    msg += `\n\n💀 <b>ELIMINATED THIS JUMP:</b>\n`;
+    msg += eliminatedThisJump.length > 0 ? eliminatedThisJump.map(p => `• ${getUsernameById(p.id)}`).join('\n') : "None";
+
+    await sendAndStoreMessage(chatId, msg, { parse_mode: "HTML" }).catch(console.error);
+
+    if (eliminatedThisJump.length > 0) {
+        const gifPath = BYE_GIF_PATH;
+        try {
+            if (fs.existsSync(gifPath)) {
+                const gifMessage = await currentBotInstance.sendAnimation(chatId, fs.createReadStream(gifPath)).catch(console.error);
+                if (gifMessage) game4MessagesToClean.push(gifMessage.message_id);
+            } else {
+                console.warn(`GIF not found at ${gifPath}. Skipping animation.`);
+            }
+
+            const kickMsg = `💀 The following players will be removed in 5 seconds:\n\n${eliminatedThisJump.map(p => `• ${getUsernameById(p.id)}`).join('\n')}`;
+            await sendAndStoreMessage(chatId, kickMsg).catch(console.error);
+
+            setTimeout(async () => {
+                for (const p of eliminatedThisJump) {
+                    try {
+                        await currentBotInstance.banChatMember(chatId, p.id).catch(console.error);
+                    } catch (err) {
+                        console.error(`❌ Failed to kick ${getUsernameById(p.id)}:`, err.message);
+                        if (err.response && err.response.description && err.response.description.includes("can't remove chat owner")) {
+                            await sendAndStoreMessage(chatId, `⚠️ Could not kick ${getUsernameById(p.id)} (likely a group owner/admin). Please remove manually.`).catch(console.error);
+                        }
+                    }
+                }
+                setTimeout(async () => {
+                    await proceedToNextJumpOrEndGame(chatId);
+                }, 3000); // Wait 3 seconds after kicking before proceeding
+            }, 5000); // Wait 5 seconds after kick message
+        } catch (err) {
+            console.error("❌ Failed to send elimination GIF or kick message:", err.message);
+            await proceedToNextJumpOrEndGame(chatId); // Proceed even if GIF/kick fails
+        }
+    } else {
+        // No eliminations, proceed directly
+        setTimeout(async () => {
+            await proceedToNextJumpOrEndGame(chatId);
+        }, 3000); // Short delay before next jump if no one was eliminated
+    }
+}
+
+async function proceedToNextJumpOrEndGame(chatId) {
+    const survivors = currentRegisteredPlayers.filter(p => p.status === "alive");
+    const playersCompletedJumps = survivors.filter(p => (p.bridgeJump || 0) >= maxJumps);
+
+    if (playersCompletedJumps.length > 0) {
+        await sendAndStoreMessage(chatId, `🎉 <b>CONGRATULATIONS!</b> The following players have successfully crossed the bridge:\n\n${playersCompletedJumps.map(p => `• ${getUsernameById(p.id)}`).join('\n')}`, { parse_mode: "HTML" }).catch(console.error);
+        // Mark these players as 'finished' or 'won' if needed, then remove from active survivors
+        playersCompletedJumps.forEach(p => p.status = "alive"); // They are still "alive" for the next game, but have completed this one.
+        fs.writeFileSync(currentPlayerDataFile, JSON.stringify(currentRegisteredPlayers, null, 2)); // Save updated status
+
+        // Check if any players are still on the bridge for next jump
+        const remainingOnBridge = currentRegisteredPlayers.filter(p => p.status === "alive" && (p.bridgeJump || 0) < maxJumps);
+        if (remainingOnBridge.length === 0) {
+            summarizeGame4(chatId);
+            return; // End game
+        }
+    }
+
+    if (game4JumpNumber >= maxJumps || survivors.length === 0) {
+        summarizeGame4(chatId);
+    } else {
+        game4JumpNumber++;
+        game4Choices = {}; // Reset choices for the next jump
+        // notification trackers are reset in announceJump
+        await sendAndStoreMessage(chatId, `Get ready for Jump ${game4JumpNumber}!`, { parse_mode: "HTML" }).catch(console.error); // Announce next jump
+        await sendJumpInstructions(chatId);
+        await sendJumpChoiceButtons(chatId);
+    }
+}
+
+async function summarizeGame4(chatId) {
+    await clearGameSpecificMessages(chatId); // Clear any lingering messages before summary
+    resetGame4State(); // Reset all game-specific state variables
+
+    // Re-read players.json to get the latest status after all eliminations/updates
+    let finalPlayers;
+    try {
+        finalPlayers = JSON.parse(fs.readFileSync(currentPlayerDataFile, 'utf8'));
+    } catch (error) {
+        console.error("Error reading players.json for final summary:", error.message);
+        finalPlayers = currentRegisteredPlayers; // Fallback to in-memory if file read fails
+    }
+
+    // Assuming initialParticipant flag is set when players first register for the entire game session
+    const totalParticipants = finalPlayers.filter(p => p.initialParticipant).length;
+    const survivors = finalPlayers.filter(p => p.status === "alive");
+    const eliminated = finalPlayers.filter(p => p.status === "eliminated");
+
+    let msg = `🏁✨ <b>GAME 4 HAS ENDED!</b> ✨🏁\n\n`;
+    msg += `👥 <b>TOTAL PARTICIPANTS:</b> ${totalParticipants}\n`;
+    msg += `✅ <b>SURVIVORS:</b> ${survivors.length}\n`;
+    msg += `💀 <b>ELIMINATED:</b> ${eliminated.length}\n\n`;
+    msg += `✅ <b>SURVIVORS LIST:</b>\n${survivors.length > 0 ? survivors.map(u => `• ${getUsernameById(u.id)}`).join('\n') : "None"}\n\n`;
+    msg += `💀 <b>ELIMINATED LIST:</b>\n${eliminated.length > 0 ? eliminated.map(u => `• ${getUsernameById(u.id)}`).join('\n') : "None"}`;
+
+    await sendAndStoreMessage(chatId, msg, { parse_mode: "HTML" }).catch(console.error);
+
+    const piggyGifPath = FALLING_MONEY_GIF_PATH;
+    try {
+        if (fs.existsSync(piggyGifPath)) {
+            const gifMessage = await currentBotInstance.sendAnimation(chatId, fs.createReadStream(piggyGifPath)).catch(console.error);
+            if (gifMessage) game4MessagesToClean.push(gifMessage.message_id);
+        } else {
+            console.warn(`GIF not found at ${piggyGifPath}. Skipping animation.`);
+        }
+    } catch (err) {
+        console.error("❌ Failed to send falling money GIF:", err.message);
+    }
+
+    // Call the gameEndCallback to notify the coordinator
+    if (gameEndCallback) {
+        gameEndCallback(currentRegisteredPlayers);
+    }
+}
+
+/**
+ * Sends jump instructions. This function is now at module level.
+ * @param {number} chatId - The ID of the chat.
+ */
+async function sendJumpInstructions(chatId) {
+    const jumpImgPath = path.resolve(__dirname, "..", "..", "images", "choose1.jpg");
+
+    try {
+        const photoMessage = await currentBotInstance.sendPhoto(chatId, fs.createReadStream(jumpImgPath), {
+            caption:
+                `🟢 <b>Jump ${game4JumpNumber}/${maxJumps}</b>\n\n` +
+                "Choose <b>👈 Left</b> or <b>👉 Right</b> wisely — only one side is safe!\n\n" +
+                "💡 <b>Rules:</b>\n" +
+                "- You have <b>1 minute</b> to make your choice.\n" +
+                "- Step on the wrong panel and you will fall and be eliminated.\n\n" +
+                "⏰ <i>Good luck, and watch your step!</i>",
+            parse_mode: "HTML"
+        }).catch(console.error);
+        if (photoMessage) game4MessagesToClean.push(photoMessage.message_id); // Store this message for cleanup
+    } catch (err) {
+        console.error("❌ Failed to send jump instructions image:", err.message);
+        await currentBotInstance.sendMessage(chatId, `🟢 Jump ${game4JumpNumber}/${maxJumps}!\nChoose Left or Right!`, { parse_mode: "HTML" }).catch(console.error);
+    } finally {
+        announceJump(chatId);
+    }
+}
+
+/**
+ * Starts the Glass Bridge game. This function is called by the game coordinator.
+ * @param {TelegramBot} bot - The Telegram bot instance.
+ * @param {number} chatId - The ID of the chat where the game is played.
+ * @param {Array<Object>} players - The array of registered players.
+ * @param {number} adminId - The ID of the admin.
+ * @param {string} playerDataFile - Path to the player data file.
+ * @param {Function} onGameEnd - Callback function to call when the game ends,
+ * it receives the updated players array.
+ * @param {Map} spamMap - Map for tracking spam from eliminated players.
+ * @param {number} sThreshold - Constant for spam threshold.
+ * @param {number} sIntervalMs - Constant for spam interval.
+ */
+async function startGame(bot, chatId, players, adminId, playerDataFile, onGameEnd, spamMap, sThreshold, sIntervalMs) {
+    // Assign passed parameters to module-scoped variables
+    currentBotInstance = bot;
+    currentChatId = chatId;
+    currentRegisteredPlayers = players;
+    currentAdminId = adminId;
+    currentPlayerDataFile = playerDataFile;
+    gameEndCallback = onGameEnd;
+    eliminatedPlayerSpamMap = spamMap;
+    spamThreshold = sThreshold;
+    spamIntervalMs = sIntervalMs;
+
+    console.log("Starting Glass Bridge Game (Game 4)...");
+
+    // Reset game state for a fresh start
+    resetGame4State();
+    game4Started = true;
+    game4JumpNumber = 1;
+
+    const alivePlayers = currentRegisteredPlayers.filter(p => p.status === "alive");
+    if (alivePlayers.length === 0) {
+        await currentBotInstance.sendMessage(currentChatId, "⚠️ There are no alive players to start Game 4! Skipping round.", { parse_mode: "HTML" }).catch(console.error);
+        if (gameEndCallback) gameEndCallback(currentRegisteredPlayers);
+        return;
+    }
+
+    // Initialize bridgeJump counter for all alive players
+    currentRegisteredPlayers.forEach(p => {
+        if (p.status === "alive") {
+            p.bridgeJump = 0; // Reset jump counter for players
+        }
+    });
+    fs.writeFileSync(currentPlayerDataFile, JSON.stringify(currentRegisteredPlayers, null, 2));
+
+    try {
+        if (fs.existsSync(BRIDGE_IMAGE_PATH)) {
+            const photoMessage = await currentBotInstance.sendPhoto(currentChatId, fs.createReadStream(BRIDGE_IMAGE_PATH), {
+                caption:
+                    "🌉 <b>GAME 4: THE GLASS BRIDGE!</b>\n\n" +
+                    "Players must cross a fragile glass bridge by jumping on glass panels suspended high above the ground.\n\n" +
+                    "In each round, you will choose to jump <b>left</b> or <b>right</b>. Only one side is safe — the other will break and you will fall.\n\n" +
+                    "🕒 <b> You have 1 minute to prepare.</b>\n\n" +
+                    `💡 You need to survive <b>${maxJumps} jumps</b> to cross safely.\n\n` +
+                    "⚔️ <i>Get ready... and choose wisely!</i>",
+                parse_mode: "HTML"
+            }).catch(console.error);
+            if (photoMessage) game4MessagesToClean.push(photoMessage.message_id);
+        } else {
+            await currentBotInstance.sendMessage(currentChatId, "🌉 Game 4: The Glass Bridge!\nPrepare to jump soon!", { parse_mode: "HTML" }).catch(console.error);
+            console.warn(`Image not found at ${BRIDGE_IMAGE_PATH}. Sending text instructions only.`);
+        }
+    } catch (err) {
+        console.error("❌ Failed to send bridge image:", err.message);
+        await currentBotInstance.sendMessage(currentChatId, "Error sending game instructions image.").catch(console.error);
+    } finally {
+        // Wait 1 minute before first jump
+        setTimeout(async () => {
+            if (!game4Started) return; // Check if game was stopped during prep time
+            await sendJumpInstructions(currentChatId);
+            await sendJumpChoiceButtons(currentChatId);
+        }, 60 * 1000);
+    }
+
+    // --- Register Bot.onText handlers for Reply Keyboard buttons ---
+    leftButtonListenerId = currentBotInstance.onText(/👈 Left/, async (msg) => {
+        handleJumpChoice(msg, "left");
+    });
+
+    rightButtonListenerId = currentBotInstance.onText(/👉 Right/, async (msg) => {
+        handleJumpChoice(msg, "right");
+    });
+
+    // Register admin stop command for this specific game
+    stopGame4ListenerId = currentBotInstance.onText(/\/stopgame4/, async (msg) => {
+        if (msg.chat.id !== currentChatId) return; // Only respond in the active game chat
+        if (msg.from.id !== currentAdminId) {
+            return currentBotInstance.sendMessage(msg.chat.id, "⚠️ Only the host can stop Game 4!", { parse_mode: "HTML" }).catch(console.error);
+        }
+        if (!game4Started) {
+            return currentBotInstance.sendMessage(msg.chat.id, "❌ Game 4 is not running!", { parse_mode: "HTML" }).catch(console.error);
+        }
+
+        console.log("Game 4 manually stopped.");
+        // Clear all listeners
+        if (leftButtonListenerId) {
+            currentBotInstance.removeTextListener(/👈 Left/, leftButtonListenerId);
+            leftButtonListenerId = null;
+        }
+        if (rightButtonListenerId) {
+            currentBotInstance.removeTextListener(/👉 Right/, rightButtonListenerId);
+            rightButtonListenerId = null;
+        }
+        if (stopGame4ListenerId) {
+            currentBotInstance.removeTextListener(/\/stopgame4/, stopGame4ListenerId);
+            stopGame4ListenerId = null;
+        }
+
+        await clearGameSpecificMessages(currentChatId);
+        await removeJumpChoiceButtons(currentChatId);
+        resetGame4State();
+
+        await currentBotInstance.sendMessage(currentChatId, "🛑 Game 4 has been forcefully stopped!", { parse_mode: "HTML" }).catch(console.error);
+
+        // Notify the game coordinator that this game has finished
+        if (gameEndCallback) {
+            gameEndCallback(currentRegisteredPlayers);
+        }
+    });
+
+    console.log("Glass Bridge game initialized and listeners set.");
+}
+
+module.exports = {
+    startGame
+};

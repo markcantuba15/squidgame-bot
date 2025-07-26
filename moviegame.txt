@@ -1,0 +1,177 @@
+
+
+
+// --- NEW GAME 10: MOVIE EMOJI GUESS ---
+
+// Make sure GROUP_CHAT_ID is defined (as discussed previously)
+// const GROUP_CHAT_ID = -123456789; // <<< REPLACE WITH YOUR ACTUAL GROUP CHAT ID
+
+let game10Active = false;
+let game10Data = {}; // { userId: { emoji, answer, guessesLeft, timeout } }
+let game10CurrentEmoji = null; // Stores the emoji combo currently being guessed in the group
+let game10CurrentAnswer = null; // Stores the answer (movie title) for the current emoji
+
+// List of movie-themed emojis and their answers. EXPAND THIS LIST!
+const movieEmojiList = [
+  { emoji: "🦁👑", answer: "The Lion King" },
+  { emoji: "🕷️🧑", answer: "Spider-Man" },
+  { emoji: "🧙‍♂️🪄", answer: "Harry Potter" },
+  { emoji: "🧊🚢", answer: "Titanic" },
+  { emoji: "🦇🧑", answer: "Batman" },
+  { emoji: "🐠🔍", answer: "Finding Nemo" },
+  { emoji: "🦕🌋", answer: "Jurassic Park" },
+  { emoji: "🤠🚀", answer: "Toy Story" },
+  { emoji: "❄️👭", answer: "Frozen" },
+  { emoji: "🐭👑", answer: "Cinderella" },
+  { emoji: "👸🍎", answer: "Snow White" },
+  { emoji: "🧞‍♂️🕌", answer: "Aladdin" },
+  { emoji: "🐘🎪", answer: "Dumbo" },
+  { emoji: "🎈🏠", answer: "Up" },
+  { emoji: "👸🐸", answer: "The Princess and the Frog" },
+  { emoji: "🎭🎩", answer: "The Greatest Showman" },
+  { emoji: "👽☎️", answer: "E.T." },
+  { emoji: "💍🌋", answer: "Lord of the Rings" },
+  { emoji: "👻🚫", answer: "Ghostbusters" },
+  { emoji: "🏎️🔥", answer: "Cars" },
+  { emoji: "🧔⚡", answer: "Shazam" },
+  { emoji: "🐼🥋", answer: "Kung Fu Panda" },
+  { emoji: "🧙‍♂️⛰️", answer: "The Hobbit" },
+  { emoji: "👓🪄", answer: "Fantastic Beasts" },
+  { emoji: "🐉🔥", answer: "How to Train Your Dragon" },
+  { emoji: "👨‍🚀🌌", answer: "Interstellar" },
+  { emoji: "🏝️🏐", answer: "Cast Away" },
+  { emoji: "👧🐕", answer: "Lassie" },
+  { emoji: "💂‍♂️🇬🇧", answer: "Paddington" },
+  { emoji: "👨‍🍳🐀", answer: "Ratatouille" },
+  { emoji: "🎬🕰️", answer: "Back to the Future" },
+  { emoji: "🧛‍♂️🩸", answer: "Dracula" },
+  { emoji: "🚢🐙", answer: "Pirates of the Caribbean" },
+  { emoji: "🕵️‍♂️🔍", answer: "Sherlock Holmes" },
+  { emoji: "🚀👨‍🚀", answer: "Lightyear" },
+  { emoji: "🌊👨‍👦", answer: "The Way of Water" },
+  { emoji: "👮‍♂️🤖", answer: "RoboCop" },
+  { emoji: "👩‍❤️‍👨💔", answer: "The Notebook" },
+  { emoji: "🎤👩", answer: "Pitch Perfect" },
+  { emoji: "🐰🏀", answer: "Space Jam" }
+];
+
+
+bot.onText(/\/startmoviegame/, async (msg) => {
+  if (msg.from.id !== ADMIN_ID) return;
+  if (game10Active) return bot.sendMessage(msg.chat.id, "⚠️ Game 10 (Movie Emoji Guess) is already running.");
+
+  let players = JSON.parse(fs.readFileSync("players.json"));
+  let alivePlayers = players.filter(p => p.status === "alive" || p.status === "safe");
+
+  if (alivePlayers.length === 0) {
+    return bot.sendMessage(msg.chat.id, "❌ No alive players found to play Game 10.");
+  }
+
+  game10Active = true;
+  game10Data = {};
+
+  // Select a random movie emoji from the list
+  const randomIndex = Math.floor(Math.random() * movieEmojiList.length);
+  const selectedMovieEmoji = movieEmojiList[randomIndex];
+  game10CurrentEmoji = selectedMovieEmoji.emoji;
+  // Store answer in lowercase for easier comparison, removing common non-alphanumeric chars
+  game10CurrentAnswer = selectedMovieEmoji.answer.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // Send emoji to the group chat
+  bot.sendMessage(GROUP_CHAT_ID,
+    `🎬 *Game 10: Movie Emoji Guess!* 🎬\nI'm thinking of a famous movie represented by these emojis. DM me your guess!\nYou have *3 guesses* and *1 minute* to figure it out.\n\nGuess the movie: ${game10CurrentEmoji}`,
+    { parse_mode: "Markdown" }
+  );
+
+  // Prepare game data for all alive players
+  for (const player of alivePlayers) {
+    game10Data[player.id] = {
+      emoji: game10CurrentEmoji,
+      answer: game10CurrentAnswer,
+      guessesLeft: 3,
+      timeout: setTimeout(() => {
+        // If a player never DMs to start, or runs out of time without guessing correctly
+        if (game10Active && game10Data[player.id]) {
+          const username = getUsernameById(player.id);
+          bot.sendMessage(GROUP_CHAT_ID, `⏰ *${username}* ran out of time for Game 10 and is eliminated! The movie was *${selectedMovieEmoji.answer}*.`, { parse_mode: "Markdown" });
+          eliminatePlayer(player.id);
+          delete game10Data[player.id];
+          checkGame10End();
+        }
+      }, 1 * 60 * 1000) // 1 minute timeout
+    };
+    // Inform individual players in DM
+    bot.sendMessage(player.id,
+      `🎯 *Game 10: Movie Emoji Guess!*\nThe emojis sent to the group chat are: ${game10CurrentEmoji}\nWhat movie do these represent? You have *3 guesses* and *1 minute*!`,
+      { parse_mode: "Markdown" });
+  }
+
+  bot.sendMessage(msg.chat.id, `🎮 Game 10 (Movie Emoji Guess) started. Emojis sent to group. Players must DM the bot to play.`);
+});
+
+
+// Handle player guesses in DM
+bot.on("message", (msg) => {
+  const userId = msg.from.id;
+  const text = msg.text;
+
+  // Only handle DMs & when Game 10 is active, and the user is part of the current game
+  if (msg.chat.type !== "private") return;
+  if (!game10Active || !game10Data[userId]) return;
+
+  const data = game10Data[userId];
+  // Normalize guess: convert to lowercase and remove non-alphanumeric characters for flexible matching
+  const guess = text.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // If a player has no guesses left, ignore further messages
+  if (data.guessesLeft <= 0) {
+    return bot.sendMessage(userId, "You've already used all your guesses or completed this round.");
+  }
+
+  data.guessesLeft--; // Decrement guesses
+
+  if (guess === data.answer) {
+    clearTimeout(data.timeout);
+    markSafe(userId); // Mark player safe
+
+    const username = getUsernameById(userId);
+    // Use the original (non-normalized) answer for display
+    const originalAnswer = movieEmojiList.find(item => item.emoji === data.emoji)?.answer || data.answer;
+
+    bot.sendMessage(userId, `🎉 Correct! The movie was *${originalAnswer}*. You're safe!`, { parse_mode: "Markdown" });
+    bot.sendMessage(GROUP_CHAT_ID, `🎉 *${username}* has correctly guessed the movie: *${originalAnswer}*! They are safe!`, { parse_mode: "Markdown" });
+
+    delete game10Data[userId]; // Remove player from active game
+    checkGame10End(); // Check if all players are done
+  } else if (data.guessesLeft === 0) {
+    clearTimeout(data.timeout);
+    eliminatePlayer(userId); // Eliminate player
+
+    const username = getUsernameById(userId);
+    const originalAnswer = movieEmojiList.find(item => item.emoji === data.emoji)?.answer || data.answer;
+
+    bot.sendMessage(userId, `☠️ Out of guesses! The movie was *${originalAnswer}*. You're eliminated.`, { parse_mode: "Markdown" });
+    bot.sendMessage(GROUP_CHAT_ID, `☠️ *${username}* ran out of guesses for the movie emoji! They are eliminated. The movie was *${originalAnswer}*.`, { parse_mode: "Markdown" });
+
+    delete game10Data[userId]; // Remove player from active game
+    checkGame10End(); // Check if all players are done
+  } else {
+    bot.sendMessage(userId, `❌ Incorrect! You have ${data.guessesLeft} guess(es) left. Keep guessing the movie!`);
+  }
+});
+
+
+// Helper function to check if all players have finished Game 10
+function checkGame10End() {
+  if (Object.keys(game10Data).length === 0 && game10Active) {
+    game10Active = false;
+    game10CurrentEmoji = null;
+    game10CurrentAnswer = null;
+    bot.sendMessage(GROUP_CHAT_ID, "🏁 Game 10: Movie Emoji Guess has ended! All active players have completed their attempts.", { parse_mode: "Markdown" });
+  }
+}bot.onText(/\/kupal_id/, (msg) => {
+  const userId = msg.from.id;
+  const username = msg.from.username;
+  console.log("User ID:", userId, "Username:", username);
+  bot.sendMessage(msg.chat.id, `Your Telegram user ID is: ${userId}`);
+});

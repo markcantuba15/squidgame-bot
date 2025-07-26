@@ -1,0 +1,200 @@
+const fs = require("fs");
+const TelegramBot = require("node-telegram-bot-api");
+const path = require("path");
+const { promisify } = require("util");
+const sleep = promisify(setTimeout);
+
+const token = "7844745835:AAHPQ6omh7DHzQlfSPBFJW8_7rqce9h0hek"; // ← Put your bot token here
+const bot = new TelegramBot(token, { polling: true });
+const ADMIN_ID = 6720248984; // Replace with your actual admin ID
+
+let registeredPlayers = [];
+let maxSlots = 0;
+let registrationOpen = false;
+
+const { startGame1, stopGame1, attachPlayerCommands } = require("./game1/red_green");
+// --- IMPORTANT: ADDED THIS LINE TO IMPORT SHAPES.JS ---
+const shapeGame = require("./game2/shapes"); // Assuming shapes.js is directly in the game2 folder
+// -------------------------------------------------------
+
+// Load players file if exists
+if (fs.existsSync("players.json")) {
+  const loadedPlayers = JSON.parse(fs.readFileSync("players.json"));
+  registeredPlayers.splice(0, registeredPlayers.length, ...loadedPlayers);
+} else {
+  fs.writeFileSync("players.json", JSON.stringify([], null, 2));
+}
+
+attachPlayerCommands(bot, registeredPlayers);
+
+// /start [slots]
+bot.onText(/\/start (\d+)/, (msg, match) => {
+  if (msg.from.id !== ADMIN_ID) {
+    return bot.sendMessage(msg.chat.id, "⚠️ Only the host can start the game!");
+  }
+
+  maxSlots = parseInt(match[1]);
+  registeredPlayers.splice(0, registeredPlayers.length); // Clear existing players in-place
+  registrationOpen = true;
+
+  fs.writeFileSync("players.json", JSON.stringify(registeredPlayers, null, 2));
+
+  const instructions = `
+🎮 *Welcome to Squid Game Registration!*
+
+- 👥 Maximum slots: *${maxSlots}*
+- 🕒 You have *2 minutes* to register.
+- 🟢 To join, type: /join
+
+⚠️ After 2 minutes, registration closes automatically.
+Good luck!
+  `;
+
+  const startImgPath = path.resolve(__dirname, "images", "start.jpg");
+  bot.sendPhoto(msg.chat.id, fs.createReadStream(startImgPath), {
+    caption: instructions,
+    parse_mode: "Markdown"
+  }).catch(err => console.error("❌ Failed to send start image:", err));
+
+  // Auto-close registration after 2 minutes
+  setTimeout(() => {
+    if (registrationOpen) {
+      registrationOpen = false;
+      bot.sendMessage(msg.chat.id, "⏰ Registration time is over! Slots are now closed.")
+        .then(() => {
+          startGameFlow(msg.chat.id);
+        });
+    }
+  }, 1 * 60 * 1000); // Changed to 1 minute as per your shapes.js logic
+});
+
+// /join
+bot.onText(/\/join/, (msg) => {
+  const userId = msg.from.id;
+  const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
+
+  if (!registrationOpen) {
+    return bot.sendMessage(msg.chat.id, "❌ Registration is not open!");
+  }
+
+  if (registeredPlayers.find(p => Number(p.id) === Number(userId))) {
+    return bot.sendMessage(msg.chat.id, `⚠️ ${username}, you have already joined!`);
+  }
+
+  if (registeredPlayers.length >= maxSlots) {
+    return bot.sendMessage(msg.chat.id, "❌ All slots are filled!");
+  }
+
+  registeredPlayers.push({
+    id: userId,
+    username,
+    status: "alive",
+    progress: 0,
+    stopped: false,
+    isRunning: false,
+    runStartTime: null,
+    hasMoved: false
+  });
+
+  fs.writeFileSync("players.json", JSON.stringify(registeredPlayers, null, 2));
+
+  const joinedMsg = `
+✅ *${username} has successfully joined!*
+
+Slots filled: *${registeredPlayers.length}/${maxSlots}*
+
+🎮 Wait for the game to start!
+  `;
+
+  bot.sendMessage(msg.chat.id, joinedMsg, { parse_mode: "Markdown" })
+    .then(() => {
+      if (registeredPlayers.length === maxSlots) {
+        registrationOpen = false;
+        bot.sendMessage(msg.chat.id, "🎉 Registration complete! All slots filled and now closed.")
+          .then(() => {
+            startGameFlow(msg.chat.id);
+          });
+      }
+    })
+    .catch(err => console.error("❌ Error sending join message:", err));
+});
+
+// /reset
+bot.onText(/\/reset/, (msg) => {
+  if (msg.from.id !== ADMIN_ID) {
+    return bot.sendMessage(msg.chat.id, "⚠️ Only the host can reset!");
+  }
+
+  registeredPlayers.splice(0, registeredPlayers.length); // Reset in-place
+  maxSlots = 0;
+  registrationOpen = false;
+
+  if (fs.existsSync("players.json")) fs.unlinkSync("players.json");
+  fs.writeFileSync("players.json", JSON.stringify([], null, 2));
+
+  bot.sendMessage(msg.chat.id, "♻️ All data reset! Ready for a new game.");
+});
+
+// /stopgame1 manual fallback
+bot.onText(/\/stopgame1/, (msg) => {
+  if (msg.from.id !== ADMIN_ID) {
+    return bot.sendMessage(msg.chat.id, "⚠️ Only the host can stop Game 1!");
+  }
+
+  stopGame1(bot, msg.chat.id, registeredPlayers);
+});
+
+
+// --- IMPORTANT: This part now correctly uses the imported shapeGame module ---
+bot.onText(/\/guess (.+)/, (msg, match) => {
+  shapeGame.onGuessCommand(bot, msg, match);
+});
+// --------------------------------------------------------------------------
+
+
+// 🌟 Game Flow
+async function startGameFlow(chatId) {
+  bot.sendMessage(chatId, "🎮 Registration done. Game will start in 5 seconds...");
+  await sleep(5000);
+
+  // Filter players who are still alive after registration (if any were eliminated by Game 1 or other means)
+  // Ensure that only alive players proceed to the next game
+  let currentAlivePlayers = registeredPlayers.filter(p => p.status === 'alive' || p.status === 'safe');
+
+  if (currentAlivePlayers.length === 0) {
+      console.log("No alive players to proceed to Game 1.");
+      return bot.sendMessage(chatId, "❌ All players eliminated before Game 1 could start. Game flow stopped.");
+  }
+
+
+  await startGame1(bot, chatId, currentAlivePlayers, ADMIN_ID); // Pass currentAlivePlayers to Game 1
+  console.log("✅ Game 1 finished!");
+
+  // After Game 1, re-filter for alive/safe players
+  currentAlivePlayers = registeredPlayers.filter(p => p.status === 'alive' || p.status === 'safe');
+
+  if (currentAlivePlayers.length === 0) {
+      console.log("No alive players to proceed to Game 2.");
+      return bot.sendMessage(chatId, "❌ All players eliminated after Game 1. Game flow stopped.");
+  }
+
+
+  bot.sendMessage(chatId, "⏳ Game 2 will begin in 1 minute. Prepare yourselves!");
+  await sleep(1 * 60 * 1000);
+
+  const game2Folder = path.join(__dirname, "game2");
+  const files = fs.readdirSync(game2Folder).filter(file => file.endsWith(".js"));
+
+  if (files.length === 0) {
+    return bot.sendMessage(chatId, "❌ No Game 2 files found in game2 folder!");
+  }
+
+  const randomGameFileName = files[Math.floor(Math.random() * files.length)]; 
+  const gameModule = require(`./game2/${randomGameFileName}`); 
+  if (typeof gameModule.start !== "function") {
+    return bot.sendMessage(chatId, `❌ ${randomGameFileName} is missing a 'start' function.`);
+  }
+
+  await gameModule.start(bot, chatId, currentAlivePlayers); 
+  console.log(`✅ Game 2 (${randomGameFileName}) finished!`);
+}
